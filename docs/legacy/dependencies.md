@@ -2,7 +2,8 @@
 
 How data and code flow from the Kafka topics to every consumer, and what that
 means for migrating the four Scala analytics jobs. Job details are in
-[inventory.md](inventory.md); per-job specs are in [jobs/](jobs/).
+[inventory.md](inventory.md); per-job specs are in [jobs/](jobs/). Bare Scala
+file names live in `spark_jobs/analytics/src/main/scala/telemetry/analytics/`.
 
 ## Data flow
 
