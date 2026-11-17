@@ -17,7 +17,17 @@ fn parse_event_time(value: &str) -> Option<i64> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
         return Some(dt.timestamp_micros());
     }
-    for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
+    for format in ["%Y-%m-%dT%H:%M%#z", "%Y-%m-%d %H:%M%#z"] {
+        if let Ok(dt) = DateTime::parse_from_str(value, format) {
+            return Some(dt.timestamp_micros());
+        }
+    }
+    for format in [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+    ] {
         if let Ok(dt) = NaiveDateTime::parse_from_str(value, format) {
             return Some(dt.and_utc().timestamp_micros());
         }
@@ -35,6 +45,29 @@ mod tests {
         array::Array,
         datatypes::{DataType, TimeUnit},
     };
+
+    #[test]
+    fn minute_precision_defaults_seconds_to_zero() {
+        let input = StringArray::from(vec![
+            Some("2025-01-02 03:04"),
+            Some("2025-01-02T03:04"),
+            Some("2025-01-02 03:04Z"),
+            Some("2025-01-02T03:04Z"),
+            Some("2025-01-02 04:04+01:00"),
+            Some("2025-01-02T04:04+01:00"),
+            Some("2025-01-01 22:04-05:00"),
+            Some("2025-01-01T22:04-05:00"),
+            Some("2025-01-02T03:60Z"),
+            Some("2025-01-02 03:04+25:00"),
+            None,
+        ]);
+        let expected = DateTime::parse_from_rfc3339("2025-01-02T03:04:00Z")
+            .unwrap()
+            .timestamp_micros();
+        let mut values = vec![Some(expected); 8];
+        values.extend([None, None, None]);
+        assert_eq!(event_time(&input).iter().collect::<Vec<_>>(), values);
+    }
 
     #[test]
     fn utc_offsets_fractional_seconds_and_nulls() {
