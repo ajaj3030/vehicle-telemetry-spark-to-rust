@@ -1,166 +1,75 @@
-# Legacy pipeline dependencies and migration slices
+# Legacy pipeline dependencies
 
-Companion to [inventory.md](inventory.md). Scala sources live in
-`spark_jobs/analytics/src/main/scala/telemetry/analytics/` (abbreviated `…/analytics/`).
+[Job inventory](inventory.md) · [Migration slices](migration-slices.md)
 
-## Data flow: Kafka topics to consumers
+## Kafka to consumers
+
+Solid arrows show data flow. The dashed arrow into Rust analytics shows the additional table opened by every CLI invocation before dispatch. The dashed arrow to external consumers shows the state lookup described by the driver. [Rust analytics runner](../../rust_pipeline/src/analytics/mod.rs#L80-L95) · [Vehicle-state consumer description](../../spark_jobs/vehicle_state_job.py#L1-L6)
 
 ```mermaid
 flowchart LR
-    gen["data_generator<br/>(data_generator/generator.py)"]
+    GEN["Synthetic telemetry generator"]
+    K1[["Kafka: vehicle_telemetry"]]
+    K2[["Kafka: vehicle_state_updates (compacted)"]]
+    GEN --> K1
+    GEN --> K2
 
-    subgraph kafka["Kafka (8 partitions, key = VIN)"]
-        tt[["vehicle_telemetry"]]
-        st[["vehicle_state_updates<br/>(compacted)"]]
+    subgraph SP["Spark reference"]
+      ST["PySpark telemetry stream"] --> T[("vehicle_telemetry")]
+      SS["PySpark state stream"] --> S[("vehicle_state")]
+      T --> B["BatteryHealthDaily"] --> BO[("analytics/battery_health_daily")]
+      T --> C["ChargingSessions"] --> CO[("analytics/charging_sessions")]
+      T --> O["OtaRollout"] --> OO[("analytics/ota_rollout")]
+      T --> D["DiagnosticAlerts"] --> DO[("analytics/diagnostic_alerts")]
+      S --> D
+      T --> F["BuildParityFixtures"]
+      S --> F
     end
 
-    gen --> tt
-    gen --> st
-
-    subgraph spark["Spark (legacy)"]
-        sj["streaming_job.py"]
-        vj["vehicle_state_job.py"]
-        vt[("vehicle_telemetry")]
-        vs[("vehicle_state<br/>raw vin")]
-        bh["BatteryHealthDaily"]
-        cs["ChargingSessions"]
-        ota["OtaRollout"]
-        da["DiagnosticAlerts"]
-        bpf["BuildParityFixtures"]
-        o_bh[("analytics/battery_health_daily")]
-        o_cs[("analytics/charging_sessions")]
-        o_ota[("analytics/ota_rollout")]
-        o_da[("analytics/diagnostic_alerts")]
+    subgraph RU["Rust"]
+      RT["rust-pipeline stream"] --> TR[("vehicle_telemetry_rust")]
+      RS["rust-pipeline state"] --> SR[("vehicle_state_rust")]
+      TR --> R["rust-pipeline analytics: four jobs"]
+      SR -->|"DiagnosticAlerts calculation"| R
+      SR -.->|"All jobs: CLI open"| R
+      R --> RO[("analytics/&lt;job&gt;_rust")]
     end
 
-    subgraph rust["Rust (target)"]
-        rs["rust-pipeline stream"]
-        rst["rust-pipeline state"]
-        vtr[("vehicle_telemetry_rust")]
-        vsr[("vehicle_state_rust")]
-        ra["rust-pipeline analytics &lt;job&gt;<br/>(stubs)"]
-        o_r[("analytics/&lt;job&gt;_rust")]
-    end
+    K1 --> ST
+    K1 --> RT
+    K2 --> SS
+    K2 --> RS
 
-    fx[("rust_pipeline/tests/fixtures")]
-    val["rust-pipeline validate / cargo test parity"]
-    dash["dashboard/app.py"]
-
-    tt --> sj --> vt
-    st --> vj --> vs
-    tt --> rs --> vtr
-    st --> rst --> vsr
-
-    vt --> bh --> o_bh
-    vt --> cs --> o_cs
-    vt --> ota --> o_ota
-    vt --> da
-    vs --> da --> o_da
-
-    vt --> bpf
-    vs --> bpf
-    bpf --> fx
-
-    vtr --> ra
-    vsr -. "diagnostic_alerts only" .-> ra
-    ra --> o_r
-
-    fx --> val
-    o_bh & o_cs & o_ota & o_da --> val
-    o_r --> val
-
-    o_bh & o_cs & o_ota & o_da --> dash
-    o_r --> dash
-    vt & vs & vtr & vsr --> dash
+    F --> P[("Input and expected Parquet fixtures")] --> PT["Rust fixture parity tests"]
+    P --> DEMO["Local demo loader"] --> DL[("Local demo Delta tables")]
+    DL --> UI["Streamlit dashboard"]
+    BO & CO & OO & DO & RO --> UI
+    T & S & TR & SR --> UI
+    BO & CO & OO & DO & RO --> V["Live Delta validator"]
+    T & S & TR & SR --> V
+    V -->|"JSON reports"| UI
+    S -.-> EXT["Service, warranty and OTA systems"]
 ```
 
-Edges come from: producer `data_generator/generator.py:272-274`; streams `spark_jobs/streaming_job.py:186-245`,
-`spark_jobs/vehicle_state_job.py:120-171`, `rust_pipeline/src/consumer.rs`, `rust_pipeline/src/vehicle_state.rs`;
-analytics `…/analytics/*.scala` (`build` methods) and `…/analytics/AnalyticsJob.scala:49-52`; Rust analytics inputs
-`rust_pipeline/src/analytics/mod.rs:82-92`; fixtures `…/analytics/BuildParityFixtures.scala:19-65`; parity
-`rust_pipeline/src/analytics/parity.rs`, `rust_pipeline/src/validate.rs`; dashboard `dashboard/app.py:212-225`, `637-760`.
+- **Producer and streams.** The generator publishes VIN-keyed records to both topics. Compose creates and configures them. Spark uses the configured telemetry and state output paths. The Rust stream entry points consume the same topics and write the suffixed outputs. [generator.py · publishing](../../data_generator/generator.py#L242-L278) · [docker-compose.yml · Kafka setup](../../docker-compose.yml#L49-L89) · [spark_jobs/streaming_job.py](../../spark_jobs/streaming_job.py) · [spark_jobs/vehicle_state_job.py](../../spark_jobs/vehicle_state_job.py) · [rust_pipeline/src/consumer.rs](../../rust_pipeline/src/consumer.rs) · [rust_pipeline/src/vehicle_state.rs](../../rust_pipeline/src/vehicle_state.rs) · [config/app_config.yaml](../../config/app_config.yaml)
+- **Batch and fixture paths.** Scala jobs load Delta in their `build` methods and share one output writer. Fixture regeneration calls all four `summarize` functions on saved Parquet. The separate Rust fixture comparison reads that Parquet, while the live validator opens paired Delta tables. The demo loader seeds local Delta paths from the fixtures. [Scala job sources](../../spark_jobs/analytics/src/main/scala/telemetry/analytics/) · [AnalyticsJob.scala](../../spark_jobs/analytics/src/main/scala/telemetry/analytics/AnalyticsJob.scala) · [BuildParityFixtures.scala](../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BuildParityFixtures.scala) · [mod.rs](../../rust_pipeline/src/analytics/mod.rs) · [parity.rs](../../rust_pipeline/src/analytics/parity.rs) · [main.rs · validation dispatch](../../rust_pipeline/src/main.rs#L77-L113) · [rust_pipeline/src/validate.rs](../../rust_pipeline/src/validate.rs) · [scripts/load_demo_data.py](../../scripts/load_demo_data.py)
+- **Consumers.** Fleet and Delta Explorer read Spark/Rust Delta paths by name. Migration reads row counts and parity reports. The state driver names external latest-state consumers, and the README names the same domains at pipeline level. The repository gives no external subscription or analytics-table-to-consumer mapping. [dashboard/app.py · table registry, Fleet, Migration and Delta Explorer](../../dashboard/app.py) · [dashboard/metrics.py](../../dashboard/metrics.py) · [vehicle_state_job.py · operational consumers](../../spark_jobs/vehicle_state_job.py#L1-L6) · [README.md · pipeline consumers](../../README.md#vehicle-telemetry-pipeline--spark--rust-migration)
 
-**No analytics job reads another analytics job's output.** All four read only the stream-produced tables
-(`…/analytics/BatteryHealthDaily.scala:43-44`, `ChargingSessions.scala:40`, `OtaRollout.scala:46-47`,
-`DiagnosticAlerts.scala:36-40`). The only downstream consumers of analytics tables are the dashboard and the parity check.
+## Analytics reads, writes and shared dependencies
 
-## Analytics jobs: reads, writes, shared code and data
+| Job | Spark calculation reads | Spark writes (Rust writes the same name with `_rust`) | Shared data | Shared job-specific Rust code |
+|---|---|---|---|---|
+| `ota_rollout` | `vehicle_telemetry`, OTA events | `analytics/ota_rollout`, unpartitioned | Enriched telemetry and telemetry fixture shared by all four. Own expected fixture. | `spark_round` (all jobs), `spark_divide` (OTA, charging and diagnostics). [OtaRollout.scala](../../spark_jobs/analytics/src/main/scala/telemetry/analytics/OtaRollout.scala) · [ota_rollout.rs](../../rust_pipeline/src/analytics/ota_rollout.rs) |
+| `battery_health_daily` | `vehicle_telemetry`, battery events | `analytics/battery_health_daily`, by `event_date` | Enriched telemetry and telemetry fixture shared by all four. Own expected fixture. | `spark_round`, `max_by` (shared with charging). [BatteryHealthDaily.scala](../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala) · [battery_health_daily.rs](../../rust_pipeline/src/analytics/battery_health_daily.rs) |
+| `charging_sessions` | `vehicle_telemetry`, charging events with session IDs | `analytics/charging_sessions`, by `session_date` | Enriched telemetry and telemetry fixture shared by all four. Own expected fixture. | `spark_round`, `spark_divide`, `max_by` (battery), `min_by` (same helper implementation), `spark_to_timestamp` (diagnostics). [ChargingSessions.scala](../../spark_jobs/analytics/src/main/scala/telemetry/analytics/ChargingSessions.scala) · [charging_sessions.rs](../../rust_pipeline/src/analytics/charging_sessions.rs) |
+| `diagnostic_alerts` | `vehicle_telemetry`, diagnostic events, and `vehicle_state` | `analytics/diagnostic_alerts`, unpartitioned | Shared telemetry and fixture, plus the sole analytical dependency on state data. Own expected fixture. | `spark_round`, `spark_divide`, `spark_to_timestamp` (charging) and streaming's `sha256_hex`. [DiagnosticAlerts.scala](../../spark_jobs/analytics/src/main/scala/telemetry/analytics/DiagnosticAlerts.scala) · [diagnostic_alerts.rs](../../rust_pipeline/src/analytics/diagnostic_alerts.rs) · [rust_pipeline/src/transforms/anonymized.rs](../../rust_pipeline/src/transforms/anonymized.rs) |
 
-| Job | Reads (data) | Writes (data) | Shared **code** — Spark side | Shared **code** — Rust side | Shared **data** with other jobs |
-|-----|--------------|---------------|------------------------------|-----------------------------|---------------------------------|
-| `battery_health_daily` | `vehicle_telemetry` `BATTERY` rows (`BatteryHealthDaily.scala:16`) | `analytics/battery_health_daily`, part. `event_date` (`BatteryHealthDaily.scala:10`) | `AnalyticsJob` trait, `Paths`, `Spark.session` (`AnalyticsJob.scala`); listed in `BuildParityFixtures.Jobs` (`BuildParityFixtures.scala:19-24`); jar/`build.sbt` | `Job` registry + `summarize` dispatcher + `run`/`write_output` (`rust_pipeline/src/analytics/mod.rs:28-111`); `parity.rs`; `validate.rs`; `spark_round` (`rust_pipeline/src/transforms/rounding.rs:7`) | Input `vehicle_telemetry` (all 4 jobs); fixture `input/telemetry` (all 4) |
-| `charging_sessions` | `vehicle_telemetry` `CHARGING` rows with a session id (`ChargingSessions.scala:13`) | `analytics/charging_sessions`, part. `session_date` (`ChargingSessions.scala:9`) | same as above | same as above | same as above |
-| `ota_rollout` | `vehicle_telemetry` `OTA` rows (`OtaRollout.scala:32`) | `analytics/ota_rollout`, unpartitioned | same as above | same as above | same as above |
-| `diagnostic_alerts` | `vehicle_telemetry` `DIAGNOSTIC` rows + **`vehicle_state`** (`DiagnosticAlerts.scala:13-20`) | `analytics/diagnostic_alerts`, unpartitioned | same as above | same as above | Above, plus `vehicle_state` / `vehicle_state_rust` (only consumer among analytics) and fixture `input/vehicle_state` |
+- **Shared Spark code.** All four extend `AnalyticsJob` (CLI, paths, UTC session, Delta overwrite) and compile into one sbt jar. `BuildParityFixtures.Jobs` calls all four Scala `summarize` implementations. [AnalyticsJob.scala](../../spark_jobs/analytics/src/main/scala/telemetry/analytics/AnalyticsJob.scala) · [BuildParityFixtures.scala](../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BuildParityFixtures.scala) · [spark_jobs/analytics/build.sbt](../../spark_jobs/analytics/build.sbt)
+- **Shared Rust code.** All four use the job registry, dispatcher, comparison settings and output writer in `mod.rs`. `spark_functions.rs` registers analytics SQL helpers and builds on streaming rounding. The fixture harness and live validator use the same comparison implementation. [mod.rs](../../rust_pipeline/src/analytics/mod.rs) · [spark_functions.rs](../../rust_pipeline/src/analytics/spark_functions.rs) · [rust_pipeline/src/transforms/rounding.rs](../../rust_pipeline/src/transforms/rounding.rs) · [parity.rs](../../rust_pipeline/src/analytics/parity.rs) · [rust_pipeline/src/validate.rs](../../rust_pipeline/src/validate.rs)
+- **Shared input boundary.** Every Rust CLI run opens both persisted streaming tables. The fixture harness also registers both Parquet inputs every time. Only diagnostic computation consults state rows. Each comparator takes one expected analytics fixture or one Spark/Rust Delta pair. [mod.rs](../../rust_pipeline/src/analytics/mod.rs) · [parity.rs](../../rust_pipeline/src/analytics/parity.rs) · [main.rs · run and validation paths](../../rust_pipeline/src/main.rs#L77-L113)
 
-Notes on the shared pieces:
+## Order and independence
 
-- **Rust registry is already complete.** `JOBS`, `summarize` and the partition test list all four jobs
-  (`rust_pipeline/src/analytics/mod.rs:49-78`, `120-131`) and the module doc says each job is ported by editing its own file
-  (`rust_pipeline/src/analytics/mod.rs:1-10`). A port therefore does not need to touch `mod.rs`.
-- **Parity harness is shared and job-agnostic**: `parity.rs` registers `telemetry` and `vehicle_state` for every job and compares
-  against `tests/fixtures/expected/<job>` (`rust_pipeline/src/analytics/parity.rs`); each job opts in by un-ignoring its own
-  `matches_spark_output` test (`rust_pipeline/src/analytics/<job>.rs:22`).
-- **Spark-semantics helpers:** only `spark_round` exists today (`rust_pipeline/src/transforms/rounding.rs:7`). Helpers needed by
-  more than one port (timestamp-µs parsing for `charging_sessions` + `diagnostic_alerts`; `max_by`/`min_by` emulation for
-  `battery_health_daily` + `charging_sessions`) do not exist yet; whichever slice first adds one becomes a code dependency for
-  the others.
-- **Scala retirement is coupled.** `BuildParityFixtures.Jobs` references all four `summarize` functions
-  (`BuildParityFixtures.scala:19-24`) and all jobs share one sbt project (`spark_jobs/analytics/build.sbt`) that CI packages
-  (`.github/workflows/ci.yml:50-65`). Deleting a single Scala job breaks fixture regeneration unless `BuildParityFixtures` is
-  edited in the same change.
-- **Dashboard is data-coupled, not code-coupled**: it reads both `analytics/<job>` and `analytics/<job>_rust` by name
-  (`dashboard/app.py:212-225`) and switches engine per page (`dashboard/app.py:644-656`), so a port needs no dashboard change.
-
-## What can migrate independently, and what must move first
-
-- **Already moved first:** both streams have Rust ports writing `vehicle_telemetry_rust` and `vehicle_state_rust`
-  (`rust_pipeline/src/main.rs:33-36`, `deploy/k8s/telemetry-stream.yaml`, `deploy/k8s/vehicle-state-stream.yaml`), and Rust
-  analytics read those tables (`rust_pipeline/src/analytics/mod.rs:82-87`). So there is no stream prerequisite left for porting.
-- **Independent:** `ota_rollout`, `charging_sessions`, `battery_health_daily` — telemetry only, no shared output, own Rust file,
-  own fixture.
-- **Independent, with an extra input:** `diagnostic_alerts` — needs `vehicle_state_rust` to be at parity
-  (`rust-pipeline validate --state`, `rust_pipeline/src/main.rs:43-55`) for live runs, and touches the raw VIN.
-- **Must move first within the analytics work:** whichever slice introduces a shared Rust helper (see above). To keep slices
-  independent, add a helper in the first slice that needs it and have later slices reuse it, or keep logic local to the job file.
-- **Must move last:** deleting Scala sources / the jar, because of `BuildParityFixtures` and the shared sbt build.
-- **Cutover** (pointing consumers at `_rust` tables and stopping the Spark job) is separate from porting: ports write new
-  `_rust` tables (`rust_pipeline/src/config.rs:230-231`), so Spark output keeps being produced until a deliberate switch.
-
-## Proposed migration slices
-
-| Slice | Files touched | Why the boundary is safe |
-|-------|---------------|--------------------------|
-| **1. `ota_rollout`** | `rust_pipeline/src/analytics/ota_rollout.rs` only (replace stub, un-ignore `matches_spark_output`); optionally reuse `rust_pipeline/src/transforms/rounding.rs` without editing it | One input (`vehicle_telemetry`), unpartitioned output, no table or code is consumed by another job, registry already wired (`mod.rs:49-78`), parity fixture exists (`tests/fixtures/expected/ota_rollout`). Spark keeps writing `analytics/ota_rollout`; the port writes `ota_rollout_rust`. |
-| **2. `charging_sessions`** | `rust_pipeline/src/analytics/charging_sessions.rs`; plus a new shared helper module (e.g. `rust_pipeline/src/analytics/spark_functions.rs` + one `mod` line in `analytics/mod.rs`) if `min_by`/`max_by` or µs `to_timestamp` are factored out | One input; output read only by dashboard/parity. If it adds a shared helper, that is a code dependency for slices 3–4 only, which come later. |
-| **3. `battery_health_daily`** | `rust_pipeline/src/analytics/battery_health_daily.rs` (reusing slice 2's `max_by` helper if present) | One input; output read only by dashboard/parity; date-partitioned write is already handled by `write_output` (`mod.rs:97-111`). |
-| **4. `diagnostic_alerts`** | `rust_pipeline/src/analytics/diagnostic_alerts.rs` (reusing slice 2's timestamp helper if present) | The only job reading `vehicle_state`; it depends on the already-ported state stream, not on any other analytics job. Raw VIN is read but must not be emitted (`validate.rs:19`). |
-| **5. Cutover per job** | `dashboard/app.py` (default engine/labels), runbooks; later `deploy/k8s/*` if analytics get scheduled | Only consumers change; can be done per job because each job has its own table pair (`dashboard/app.py:212-225`). |
-| **6. Retire Scala** | `…/analytics/*.scala`, `spark_jobs/analytics/build.sbt`, `.github/workflows/ci.yml` (scala job), `dashboard/app.py:245-279` (spark-submit), `README.md` | Only after slices 1–4: `BuildParityFixtures` and the shared sbt project couple all four Scala jobs (`BuildParityFixtures.scala:19-24`). Fixtures are already committed, so Rust tests keep working without Scala. |
-
-Slices 1–4 each touch a disjoint Rust job file, so they can run in parallel branches; only an optional shared helper module
-creates an ordering (introduce it in whichever slice lands first, others rebase onto it).
-
-## Recommended first slice: `ota_rollout`
-
-Scored on what the request asks for — fewest inputs, fewest Spark-specific behaviours to reproduce:
-
-| Job | Inputs | Spark-specific behaviours to reproduce (see `jobs/<job>.md`) | Partitioned output |
-|-----|--------|-----------------------------------------------------------|--------------------|
-| `ota_rollout` | 1 | pivot over fixed list + `na.fill`; Int64 counts; `DESC NULLS LAST`; `round` HALF_UP; `/0 → NULL` | no |
-| `charging_sessions` | 1 | `min_by`/`max_by` (not in DataFusion); `to_timestamp` µs; `cast(ts as double)`; `round` ×3 scales; `to_date` UTC; rounded-value guard | yes (`session_date`) |
-| `battery_health_daily` | 1 | `max_by`; `RANGE` window over epoch seconds; `lag` over gaps; `round(avg)`; Int64 widths | yes (`event_date`) |
-| `diagnostic_alerts` | 2 | `sha2` of raw VIN + left join; eager `count()`; `count(DISTINCT)`; `dense_rank` Int32 vs UInt64; `DESC NULLS LAST`; `to_timestamp` µs; `round` | no |
-
-`ota_rollout` ties with two others on inputs and has the fewest and simplest Spark behaviours: every one of them is expressible in
-plain DataFusion SQL plus `spark_round`, with no missing aggregate function, no timestamp handling and no range frame
-(`jobs/ota_rollout.md`). Its output is unpartitioned, so the write path is the simplest (`mod.rs:97-111`). It still exercises the
-whole pattern end to end: read Rust stream table → `summarize` → `write_output` → `ota_rollout_rust` → `rust-pipeline validate --job`
-→ dashboard engine switch, plus the CI parity test. It is also the slice the OTA team owns and has asked to take first (stated in
-the migration request; ownership is not recorded in the repository — there is no CODEOWNERS file).
-
-Risks to cover inside slice 1, because the fixture does not (`jobs/ota_rollout.md`, "Nulls and edge cases"): add Rust unit tests
-for a group whose latest states are all outside the pivot list (`vehicles = 0`, null rates), a null `target_software_version`,
-and a null `update_state`. Also keep the slice to the Spark contract: open PR #6 (base `demo-privacy-base`) adds a raw `vin`
-column and a `vehicle_state` join to the Rust `ota_rollout`, which would make it a two-input job emitting a column forbidden by
-`rust_pipeline/src/validate.rs:19`.
+1. **Have the upstream data ready first.** Trusted enriched Rust telemetry is the data prerequisite for every job. The current CLI also requires a readable Rust state table for all four. Diagnostics additionally needs equivalent state contents and fleet coverage to match Spark. The two Rust stream processors and the stream comparator already exist. [deploy/k8s/kustomization.yaml](../../deploy/k8s/kustomization.yaml) · [mod.rs](../../rust_pipeline/src/analytics/mod.rs) · [DiagnosticAlerts.scala](../../spark_jobs/analytics/src/main/scala/telemetry/analytics/DiagnosticAlerts.scala) · [main.rs · stream validation](../../rust_pipeline/src/main.rs#L96-L113)
+2. **Analytics can migrate one at a time.** None reads another analytics output. The three telemetry-only calculations are independent of all other calculations. Diagnostics can also move independently once both stream inputs are suitable. The first job using a required helper must have that helper available. With the shared module in place, later job implementations can stay in their own Rust files. [BatteryHealthDaily.scala](../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala) · [ChargingSessions.scala](../../spark_jobs/analytics/src/main/scala/telemetry/analytics/ChargingSessions.scala) · [OtaRollout.scala](../../spark_jobs/analytics/src/main/scala/telemetry/analytics/OtaRollout.scala) · [DiagnosticAlerts.scala](../../spark_jobs/analytics/src/main/scala/telemetry/analytics/DiagnosticAlerts.scala) · [mod.rs](../../rust_pipeline/src/analytics/mod.rs) · [spark_functions.rs](../../rust_pipeline/src/analytics/spark_functions.rs)
+3. **Retire the reference last.** Use distinct Spark and Rust outputs during parity, then move consumer bindings one job at a time after comparison on aligned inputs. Maintain the Spark reference and jar as long as operators or fixture regeneration still need them. Removing an object requires changing the Scala fixture registry that calls it. [config.rs · distinct output paths](../../rust_pipeline/src/config.rs#L225-L233) · [dashboard/app.py · consumer source selector](../../dashboard/app.py#L637-L656) · [BuildParityFixtures.scala](../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BuildParityFixtures.scala) · [spark_jobs/analytics/build.sbt](../../spark_jobs/analytics/build.sbt)

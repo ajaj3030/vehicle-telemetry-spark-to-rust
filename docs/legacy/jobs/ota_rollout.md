@@ -1,87 +1,39 @@
-# `ota_rollout` — functional spec
+# `ota_rollout` functional spec
 
-Source: `spark_jobs/analytics/src/main/scala/telemetry/analytics/OtaRollout.scala` (abbreviated `OtaRollout.scala`).
-Rust target: `rust_pipeline/src/analytics/ota_rollout.rs` (currently a stub, `ota_rollout.rs:16`).
+Tracks the latest OTA result for each vehicle and target version, then reports status counts and success and failure rates by target version and model. Results describe the telemetry snapshot available to the batch run. [OtaRollout.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/OtaRollout.scala#L8-L47) · [dashboard/app.py · Fleet](../../../dashboard/app.py#L714-L731)
 
-## Purpose
+## Inputs and output
 
-For each OTA rollout (target software version × model), how many vehicles are in each update state *right now*, and the
-success and failure rates — "latest OTA update state per vehicle, pivoted by target software version and model, with
-success and failure rates" (`dashboard/app.py:178-207`, `OtaRollout.scala:26-44`).
+Reads enriched Delta `vehicle_telemetry` columns `event_type`, `vin_hash`, `target_software_version`, `sequence_number`, `model_safe` and `update_state`. `vin_hash` and `model_safe` come from stream enrichment. Writes the unpartitioned Delta table `analytics/ota_rollout` by full overwrite. The output grain and Rust comparison key are `(target_software_version, model_safe)`. [OtaRollout.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/OtaRollout.scala#L26-L47) · [AnalyticsJob.scala · paths, UTC session and Delta writer](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/AnalyticsJob.scala#L42-L94) · [config/app_config.yaml](../../../config/app_config.yaml) · [spark_jobs/transforms.py](../../../spark_jobs/transforms.py) · [Rust implementation and tests](../../../rust_pipeline/src/analytics/ota_rollout.rs)
 
-## Inputs
+| Output column, in calculation order | Type |
+|---|---|
+| `target_software_version` | string |
+| `model_safe` | string |
+| `UPDATE_STATE_IN_PROGRESS` | bigint |
+| `UPDATE_STATE_WAITING_ON_BCM` | bigint |
+| `UPDATE_STATE_SUCCESS` | bigint |
+| `UPDATE_SUCCESS_WITH_WARNINGS` | bigint |
+| `UPDATE_STATE_FAILED` | bigint |
+| `UPDATE_FAILED_DRIVE_ALLOWED` | bigint |
+| `UPDATE_FAILED_NO_ACTION` | bigint |
+| `vehicles` | bigint |
+| `success_rate_pct` | double |
+| `failure_rate_pct` | double |
 
-| Table | Columns used | Source |
-|-------|--------------|--------|
-| `vehicle_telemetry` (Spark) / `telemetry` registered from `vehicle_telemetry_rust` (Rust) | `event_type`, `vin_hash`, `target_software_version`, `sequence_number`, `model_safe`, `update_state` | `OtaRollout.scala:26-44`, `OtaRollout.scala:46-47`, `rust_pipeline/src/analytics/mod.rs:82-87` |
-
-No `vehicle_state`, no other analytics table (`OtaRollout.scala:46-47` reads telemetry only).
-
-## Output schema
-
-Unpartitioned Delta table `analytics/ota_rollout` (`OtaRollout.scala` does not override `partitionCols`; `rust_pipeline/src/analytics/ota_rollout.rs:11`).
-Types from `rust_pipeline/tests/fixtures/expected/ota_rollout` (6 rows), column order as Spark emits it:
-
-| # | Column | Type | Nullable in practice |
-|---|--------|------|----------------------|
-| 1 | `target_software_version` | string | yes (null group key is kept) |
-| 2 | `model_safe` | string | no (T1 coalesce, `spark_jobs/transforms.py:73`) |
-| 3 | `UPDATE_STATE_IN_PROGRESS` | bigint | no (`na.fill(0)`) |
-| 4 | `UPDATE_STATE_WAITING_ON_BCM` | bigint | no |
-| 5 | `UPDATE_STATE_SUCCESS` | bigint | no |
-| 6 | `UPDATE_SUCCESS_WITH_WARNINGS` | bigint | no |
-| 7 | `UPDATE_STATE_FAILED` | bigint | no |
-| 8 | `UPDATE_FAILED_DRIVE_ALLOWED` | bigint | no |
-| 9 | `UPDATE_FAILED_NO_ACTION` | bigint | no |
-| 10 | `vehicles` | bigint | no |
-| 11 | `success_rate_pct` | double | yes, when `vehicles = 0` |
-| 12 | `failure_rate_pct` | double | yes, when `vehicles = 0` |
-
-Parity key: `target_software_version`, `model_safe` (`rust_pipeline/src/analytics/ota_rollout.rs:10`).
+[Spark Parquet fixture](../../../rust_pipeline/tests/fixtures/expected/ota_rollout) · [OtaRollout.scala · status columns and expressions](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/OtaRollout.scala#L11-L44)
 
 ## Calculation
 
-1. Filter telemetry to `event_type = 'OTA'` (`OtaRollout.scala:32`).
-2. Window `PARTITION BY vin_hash, target_software_version ORDER BY sequence_number DESC`; keep `row_number() = 1`, i.e. the
-   newest OTA event per vehicle per target version (`OtaRollout.scala:27-34`).
-3. Group by `target_software_version`, `model_safe` (`OtaRollout.scala:37`).
-4. Pivot `update_state` over the **fixed** list of seven values in `UpdateStates` and `count()` rows per value
-   (`OtaRollout.scala:11-19`, `38-39`). Columns appear in list order.
-5. Replace null pivot counts with `0` (`OtaRollout.scala:40`).
-6. `vehicles` = sum of the seven state columns (`OtaRollout.scala:23`, `41`).
-7. `success_rate_pct = round((UPDATE_STATE_SUCCESS + UPDATE_SUCCESS_WITH_WARNINGS) / vehicles * 100, 2)` (`Succeeded`, `OtaRollout.scala:20`, `24`, `42`).
-8. `failure_rate_pct = round((UPDATE_STATE_FAILED + UPDATE_FAILED_DRIVE_ALLOWED + UPDATE_FAILED_NO_ACTION) / vehicles * 100, 2)` (`Failed`, `OtaRollout.scala:21`, `24`, `43`).
-   `IN_PROGRESS` and `WAITING_ON_BCM` count toward `vehicles` but neither rate, so the two rates need not sum to 100.
+1. Filter to `event_type = 'OTA'`. Use `row_number()` partitioned by `(vin_hash, target_software_version)` and ordered by `sequence_number DESC NULLS LAST`. Keep row 1. A vehicle can contribute to multiple target versions. For a single target it contributes to the model on that selected row. [OtaRollout.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/OtaRollout.scala#L26-L34)
+2. Group the selected events by `(target_software_version, model_safe)`. Pivot onto the seven listed states, count rows per state and fill missing pivot counts with zero. Sum those seven counts as `vehicles`. [OtaRollout.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/OtaRollout.scala#L11-L23) · [OtaRollout.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/OtaRollout.scala#L36-L43)
+3. For success, sum `UPDATE_STATE_SUCCESS` and `UPDATE_SUCCESS_WITH_WARNINGS`. For failure, sum `UPDATE_STATE_FAILED`, `UPDATE_FAILED_DRIVE_ALLOWED` and `UPDATE_FAILED_NO_ACTION`. For each, divide by `vehicles` as a double, multiply by 100 and round HALF_UP to two decimal places. The in-progress and waiting states contribute to the denominator only, so the rates can sum to less than 100%. [OtaRollout.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/OtaRollout.scala#L20-L24) · [OtaRollout.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/OtaRollout.scala#L36-L43) · [rust_pipeline/src/analytics/spark_functions.rs](../../../rust_pipeline/src/analytics/spark_functions.rs)
 
 ## Nulls and edge cases
 
-- **Vehicle with several target versions:** counted once per target version — the window partitions by both keys (`OtaRollout.scala:27-29`).
-- **Same vehicle in two models:** not possible in practice; `model_safe` derives from the vehicle's model (`spark_jobs/transforms.py:73`), and the generator gives a vehicle one model (`data_generator/generator.py`).
-- **`update_state` null or outside the seven values:** the row still survives the window and still forms/joins its group, but contributes to no pivot column. A group whose latest rows are *all* outside the list is still emitted with every state column 0, `vehicles = 0`.
-- **`vehicles = 0`:** `x / 0` in non-ANSI Spark SQL is `NULL`, so both rates are null (`OtaRollout.scala:24`; ANSI mode is not enabled in `AnalyticsJob.scala:56-66`).
-- **Null `target_software_version`:** forms its own window partition and its own output group (Spark groups nulls together). The parity join treats null keys as equal (`rust_pipeline/src/validate.rs:233-240`).
-- **Ties on `sequence_number` within a partition:** `row_number` picks one row arbitrarily. The generator makes `sequence_number` strictly increasing per vehicle (`data_generator/generator.py:150-154`), and the fixture has no duplicate `(vin_hash, sequence_number)` pairs, so this does not arise in fixtures.
-- **Fixture coverage:** all seven states appear in `rust_pipeline/tests/fixtures/input/telemetry`, but the expected output has only 6 rows and none with `vehicles = 0` or a null target version — those cases are untested by the parity fixture.
+- A null `event_type` fails the filter. A null target version forms a bucket of its own. A null VIN hash groups with other null hashes for the same target. A null sequence sorts after populated sequences. A tie for first, including an all-null sequence partition, has no deterministic tiebreaker. [OtaRollout.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/OtaRollout.scala#L26-L37)
+- A null or unlisted state on the latest event contributes to none of the seven counts, even when an older event had a listed state. A group with only these latest states survives with `vehicles = 0` and both rates null under the stock non-ANSI session. Empty OTA input yields no groups. [OtaRollout.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/OtaRollout.scala#L23-L44) · [AnalyticsJob.scala · paths, UTC session and Delta writer](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/AnalyticsJob.scala#L42-L94) · [Rust implementation and tests](../../../rust_pipeline/src/analytics/ota_rollout.rs)
 
-## Spark behaviour hardest to reproduce in Rust
+## Hardest Spark behaviour to reproduce
 
-1. **`pivot(col, values).count()` + `na.fill`** — DataFusion has no `PIVOT`; it must be emulated with one
-   `SUM(CASE WHEN update_state = '<state>' THEN 1 ELSE 0 END)` per state, preserving Spark's column order and emitting
-   groups whose rows fall outside the list (`OtaRollout.scala:38-40`).
-2. **Integer width** — pivot counts and `vehicles` are `bigint` (Int64) in the fixture; DataFusion `SUM` of an `Int32`/`Int64`
-   literal must be cast to `BIGINT`, and `row_number()` returns `UInt64` in DataFusion, which must not leak into the output.
-   `check_types` makes a type mismatch a parity failure (`rust_pipeline/src/analytics/mod.rs:36-45`).
-3. **`DESC` null ordering** — Spark `.desc` is `NULLS LAST`; DataFusion `DESC` defaults to `NULLS FIRST`, so the window needs an
-   explicit `NULLS LAST` to pick the same row if `sequence_number` is ever null (`OtaRollout.scala:29`).
-4. **`round(x, 2)`** — Spark rounds `HALF_UP` on the decimal value; use `spark_round` (`rust_pipeline/src/transforms/rounding.rs:7`)
-   or an equivalent, not `f64::round` on the scaled binary value.
-5. **Division by zero → `NULL`** rather than `inf`/`NaN`/error (`OtaRollout.scala:24`).
-
-Everything else (filter, window, group by, sum) is plain SQL.
-
-## Pending change to watch
-
-PR #6 (`ota_rollout: include a failed vehicle's VIN for support lookups`, base `demo-privacy-base`) adds a raw `vin` column to
-the Rust `ota_rollout` output by joining `vehicle_state`. That would add a second input and a column that
-`rust_pipeline/src/validate.rs:19` (`FORBIDDEN_PII_COLUMNS`) rejects, and it diverges from the Spark contract above. This
-spec documents the Spark job as it is on `demo-prepared`.
+The explicit pivot preserves groups whose latest states are all outside the list. Conditional counts must run over all latest rows, retain the fixed output column names and order, and return Int64. Filtering to recognised states before selecting the latest row changes which observation wins. The Rust port uses conditional aggregation, explicit null ordering and the shared Spark division and rounding helpers. [OtaRollout.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/OtaRollout.scala#L26-L44) · [Rust implementation and tests](../../../rust_pipeline/src/analytics/ota_rollout.rs) · [rust_pipeline/src/analytics/spark_functions.rs](../../../rust_pipeline/src/analytics/spark_functions.rs)
