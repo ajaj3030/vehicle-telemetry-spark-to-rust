@@ -1,78 +1,41 @@
-# `battery_health_daily` — functional spec
+# `battery_health_daily` functional spec
 
-Source: `spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala` (abbreviated `BatteryHealthDaily.scala`).
-Rust target: `rust_pipeline/src/analytics/battery_health_daily.rs` (currently a stub, `battery_health_daily.rs:16`).
+Summarizes daily battery readings for warranty and service, including charge level, temperature, alerts and changes in end-of-day health. [BatteryHealthDaily.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala#L7-L41)
 
-## Purpose
+## Inputs and output
 
-Per vehicle per day: charge level, cell temperatures, thermal alerts, end-of-day battery health and its day-over-day change
-(`dashboard/app.py:178-207`, `BatteryHealthDaily.scala:14-41`).
+Reads enriched Delta `vehicle_telemetry` columns `event_type`, `vin_hash`, `event_date`, `model_safe`, `charge_percent`, `max_cell_temp`, `cell_temp_spread`, `thermal_alert`, `battery_health_level` and `sequence_number`. Stream enrichment supplies the UTC date, cell temperature spread and thermal alert. Overwrites Delta `analytics/battery_health_daily`, partitioned by `event_date`. The actual grain is `(vin_hash, event_date, model_safe)`. The Rust comparison key is `(vin_hash, event_date)`, which assumes a single model group per VIN and date. [BatteryHealthDaily.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala#L7-L44) · [streaming_job.py · UTC session](../../../spark_jobs/streaming_job.py#L123-L144) · [spark_jobs/transforms.py](../../../spark_jobs/transforms.py) · [AnalyticsJob.scala · paths, UTC session and Delta writer](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/AnalyticsJob.scala#L42-L94) · [config/app_config.yaml](../../../config/app_config.yaml) · [Rust implementation and tests](../../../rust_pipeline/src/analytics/battery_health_daily.rs)
 
-## Inputs
+| Output column, in calculation order | Type |
+|---|---|
+| `vin_hash` | string |
+| `event_date` | date |
+| `model_safe` | string |
+| `readings` | bigint |
+| `avg_charge_percent` | double |
+| `min_charge_percent` | double |
+| `peak_cell_temp` | double |
+| `avg_cell_temp_spread` | double |
+| `thermal_alert_count` | bigint |
+| `health_level_end_of_day` | double |
+| `peak_cell_temp_3d` | double |
+| `health_change` | double |
 
-| Table | Columns used | Source |
-|-------|--------------|--------|
-| `vehicle_telemetry` | `event_type`, `vin_hash`, `event_date`, `model_safe`, `charge_percent`, `max_cell_temp`, `cell_temp_spread`, `thermal_alert`, `battery_health_level`, `sequence_number` | `BatteryHealthDaily.scala:14-41` |
-
-`event_date` (UTC), `cell_temp_spread` and `thermal_alert` are enrichment outputs of T2–T4 (`spark_jobs/transforms.py:87`, `117-118`, `129-132`).
-
-## Output schema
-
-Delta table `analytics/battery_health_daily`, **partitioned by `event_date`** (`BatteryHealthDaily.scala:10`,
-`rust_pipeline/src/analytics/battery_health_daily.rs:11`). Types from `rust_pipeline/tests/fixtures/expected/battery_health_daily`:
-
-| Column | Type | Notes |
-|--------|------|-------|
-| `vin_hash` | string | parity key with `event_date` (`battery_health_daily.rs:10`) |
-| `event_date` | date | partition column |
-| `model_safe` | string | |
-| `readings` | bigint | |
-| `avg_charge_percent` | double | 2 dp |
-| `min_charge_percent` | double | |
-| `peak_cell_temp` | double | |
-| `avg_cell_temp_spread` | double | 3 dp |
-| `thermal_alert_count` | bigint | |
-| `health_level_end_of_day` | double | nullable (15 nulls in fixture) |
-| `peak_cell_temp_3d` | double | |
-| `health_change` | double | 2 dp; nullable (161 nulls in fixture) |
+[Spark Parquet fixture](../../../rust_pipeline/tests/fixtures/expected/battery_health_daily) · [BatteryHealthDaily.scala · output expressions](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala#L14-L41)
 
 ## Calculation
 
-1. Filter `event_type = 'BATTERY'` (`BatteryHealthDaily.scala:16`).
-2. Group by `vin_hash`, `event_date`, `model_safe` (`BatteryHealthDaily.scala:17`) and aggregate (`BatteryHealthDaily.scala:18-26`):
-   - `readings = count(*)`
-   - `avg_charge_percent = round(avg(charge_percent), 2)`; `min_charge_percent = min(charge_percent)`
-   - `peak_cell_temp = max(max_cell_temp)`
-   - `avg_cell_temp_spread = round(avg(cell_temp_spread), 3)`
-   - `thermal_alert_count = sum(cast(thermal_alert as int))`
-   - `health_level_end_of_day = max_by(battery_health_level, sequence_number)` — health on the day's last reading
-3. `peak_cell_temp_3d = max(peak_cell_temp)` over `PARTITION BY vin_hash ORDER BY cast(cast(event_date as timestamp) as long)
-   RANGE BETWEEN 2 days PRECEDING AND CURRENT ROW` (`SecondsPerDay`, `BatteryHealthDaily.scala:12`, `28-32`, `36`) — the
-   current day and the two *calendar* days before it, only those that have rows.
-4. `health_change = round(health_level_end_of_day - lag(health_level_end_of_day, 1), 2)` over `PARTITION BY vin_hash ORDER BY
-   event_date` (`BatteryHealthDaily.scala:33`, `37-40`) — the previous *row*, i.e. the previous day that has data.
+1. Keep `BATTERY` events. Group by `vin_hash`, `event_date` and `model_safe`. [BatteryHealthDaily.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala#L14-L17)
+2. Count all rows as `readings`. Take average charge rounded to two decimals, minimum charge, maximum cell temperature and average cell temperature spread rounded to three decimals. Sum `thermal_alert` cast to integer (true = 1, false = 0). Use `max_by(battery_health_level, sequence_number)` for the end-of-day reading. [BatteryHealthDaily.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala#L18-L26)
+3. For each VIN, convert `event_date` to UTC midnight and then to epoch seconds. Use an inclusive value-based `RANGE` from 172,800 seconds before the current row to the current row. Take the maximum daily `peak_cell_temp` over this frame as `peak_cell_temp_3d`. [BatteryHealthDaily.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala#L10-L12) · [BatteryHealthDaily.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala#L28-L36) · [AnalyticsJob.scala · paths, UTC session and Delta writer](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/AnalyticsJob.scala#L42-L94)
+4. For each VIN, sort by ascending date and subtract the preceding output row's `health_level_end_of_day` from the current row's value, rounded HALF_UP to two decimals. `lag(…, 1)` steps back one row, so it can reach over gaps longer than the rolling temperature window. [BatteryHealthDaily.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala#L33-L40) · [rust_pipeline/src/analytics/spark_functions.rs](../../../rust_pipeline/src/analytics/spark_functions.rs)
 
 ## Nulls and edge cases
 
-- **Date gaps** (5 vehicles in the fixture): the 3-day `RANGE` window skips missing days (a day after a 3-day gap sees only
-  itself), whereas `lag` reaches back across the gap to the last day with data. The two windows deliberately differ.
-- **First day per vehicle:** `lag` is null → `health_change` null.
-- **Null health on the last reading:** `max_by` returns the value from the max-`sequence_number` row even when it is null
-  (Spark 3.5 `MaxMinBy`), so `health_level_end_of_day` is null and so is that day's and the next day's `health_change`.
-  Fixture: 15 null end-of-day values, 161 null `health_change`.
-- **`avg`/`min`/`max`** ignore nulls; all-null inputs give null. `thermal_alert` is never null after T4 (`spark_jobs/transforms.py:60`, `129-132`), so `thermal_alert_count` is non-null.
-- **`event_date`** is derived in UTC by the stream (`spark_jobs/transforms.py:82-87`); the window's day-seconds also use UTC
-  (`AnalyticsJob.scala:56-66`), so midnight boundaries are consistent.
-- **Model change within a day** would produce two rows for the same parity key; not possible with generator data (one model per vehicle).
+- Null or non-battery event types are filtered. Null grouping keys are their own buckets. `count(*)` includes readings with missing values. `avg`, `min`, `max` and `sum` skip nulls and return null if their inputs are all null. [BatteryHealthDaily.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala#L14-L26) · [Rust implementation and tests](../../../rust_pipeline/src/analytics/battery_health_daily.rs)
+- `max_by` skips null ordering keys and returns null if all ordering keys are null. It can return a null health value from the highest sequence. Equal maximum sequences have no tiebreaker. The first lagged row and any subtraction with either operand null produce null `health_change`. [BatteryHealthDaily.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala#L18-L26) · [BatteryHealthDaily.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala#L33-L40) · [rust_pipeline/src/analytics/spark_functions.rs](../../../rust_pipeline/src/analytics/spark_functions.rs)
+- No rows are synthesized for missing dates. A null date sorts first in the lag window, and its rolling range covers its null-date peers. Multiple models on one date produce multiple daily rows for the same VIN/date. Both windows cross models within that VIN; the range includes same-date peers and the date-only lag has no defined order within those peers. [BatteryHealthDaily.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala#L17-L39) · [Rust implementation and tests](../../../rust_pipeline/src/analytics/battery_health_daily.rs)
 
-## Spark behaviour hardest to reproduce in Rust
+## Hardest Spark behaviour to reproduce
 
-1. **`max_by(value, ordering)`** — has no built-in equivalent in DataFusion 43 (`rust_pipeline/Cargo.lock`, via `deltalake` in `rust_pipeline/Cargo.toml:13`); must be
-   emulated (e.g. `row_number` per group, or `LAST_VALUE … ORDER BY sequence_number`) while keeping "null at the max row wins".
-2. **`RANGE` window over seconds** — DataFusion must order by an integer epoch-seconds expression (or a date with an interval
-   frame) to reproduce `RANGE BETWEEN 172800 PRECEDING AND CURRENT ROW`; a `ROWS` frame gives wrong answers on the 5 gap vehicles.
-3. **`lag` across gaps** combined with null propagation in subtraction and rounding.
-4. **`round(avg(…))` HALF_UP** at 2 and 3 dp (`rust_pipeline/src/transforms/rounding.rs:7`); `avg` of doubles must match
-   Spark's summation order closely enough for the `1e-9` tolerance (`rust_pipeline/src/validate.rs:23`).
-5. **Integer widths** — `count(*)` and `sum(int)` are `bigint` in Spark.
-6. **Partitioning by a `date` column** (`rust_pipeline/src/analytics/mod.rs:97-111`).
+The two windows use different frames over the same daily rows. A three-row frame changes the temperature result across missing dates, and a calendar join changes the meaning of lag. Preserve inclusive UTC day boundaries and null ordering. Preserve `max_by` selection when the winning measurement is null, and apply decimal HALF_UP rounding at the same stages. [BatteryHealthDaily.scala](../../../spark_jobs/analytics/src/main/scala/telemetry/analytics/BatteryHealthDaily.scala#L18-L40) · [Rust implementation and tests](../../../rust_pipeline/src/analytics/battery_health_daily.rs) · [rust_pipeline/src/analytics/spark_functions.rs](../../../rust_pipeline/src/analytics/spark_functions.rs)
