@@ -1,6 +1,7 @@
 streamlit>=1.36.0
+duckdb>=0.10.0
 plotly>=5.22.0
-deltalake>=0.18.0
+deltalake>=0.25.2
 pyarrow>=16.0.0
 pandas>=2.0.0
 pyyaml>=6.0.1
