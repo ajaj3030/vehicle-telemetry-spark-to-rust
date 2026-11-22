@@ -119,7 +119,7 @@ def get_delta_table_info(table_path: str) -> dict | None:
         import pyarrow as pa
         dt = DeltaTable(str(resolve_path(table_path)))
         add_actions = pa.table(dt.get_add_actions(flatten=True)).to_pydict()
-        schema = dt.schema().to_arrow()
+        schema = dt.schema().to_pyarrow()
         return {
             "version": dt.version(),
             "num_files": len(add_actions.get("path", [])),
