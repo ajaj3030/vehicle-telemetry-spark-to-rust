@@ -1,6 +1,7 @@
 pub mod anonymized;
 pub mod battery_features;
 pub mod event_features;
+pub mod event_time;
 pub mod health_features;
 pub mod location_features;
 pub mod null_handling;
